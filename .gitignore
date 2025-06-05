@@ -1,0 +1,6 @@
+.build/
+target/
+dependencies/
+*.f
+*.vcd
+waveforms/
