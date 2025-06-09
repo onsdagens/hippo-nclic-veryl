@@ -9,6 +9,7 @@ module instantiate (
     i_rs1     : input Reg        ,
     i_rd      : input Reg        ,
     i_csr_op  : input CsrOp      ,
+    i_return  : input logic      ,
 ) {
     inst nclic: NCLIC::<8> (
         i_clk       ,
@@ -19,6 +20,7 @@ module instantiate (
         i_rs1       ,
         i_rd        ,
         i_csr_op    ,
+        i_return    ,
     );
 }
 module NCLIC::<Vectors: u32> #(
@@ -39,7 +41,18 @@ module NCLIC::<Vectors: u32> #(
     i_rd      : input Reg        ,
     i_csr_op  : input CsrOp,
     // -----
+    i_return  : input logic,
+    o_dispatch: output logic,
+    o_depth: output logic<2>,
 ) {
+//    var curr_index: logic<3>;
+    var dispatch: logic;
+    var prio_stack: logic<2> [4]; // 4 prio levels so max depth = 4 
+    var id_stack: logic<3> [4];
+    var current_depth: logic<2>;
+    assign o_depth = current_depth;
+    assign o_dispatch = dispatch;
+    
     // config: [PrioBits bit prio |1 bit pend | 1 bit ena]
     const config_width: u32 = PrioBits + 1 + 1;
     // having these be 32 bit feels notgood
@@ -71,7 +84,17 @@ module NCLIC::<Vectors: u32> #(
                 config_regs[i] = 0;
             } else {
                 if config_reg_w_ena_intmd[i] {
-                    config_regs[i] = config_reg_intmd[i];
+                    if max_index != (i as 3) || !dispatch{
+                        config_regs[i] = config_reg_intmd[i];
+                    }
+                    else {
+                        // if we've dispatched this already then don't set the pending bit
+                        config_regs[i] = config_reg_intmd[i] & ('b1101 as 32);
+                    }
+                }
+                else if max_index == (i as 3) && dispatch {
+                    // unpend self if we dispatch self
+                    config_regs[i] = config_regs[i] & ('b1101 as 32);
                 }
             }
 
@@ -94,23 +117,34 @@ module NCLIC::<Vectors: u32> #(
         prio_o: max_prio,
     );
 
-    // some state machinery for keeping track of when an interrupt should be dispatched
-    var prev_prio: logic<2>;
-    var curr_index: logic<3>;
-    var dispatch: logic;
+    // some state machinery for interrupt dispatch 
+//    var prev_prio: logic<2>;
     always_ff {
         if_reset {
-            prev_prio = 0;
-            curr_index = 0;
+            prio_stack = {0,0,0,0};
+            id_stack = {0,0,0,0};
+            current_depth = 0;
         } else {
-            if max_prio >: prev_prio {
+            if max_prio >: prio_stack[current_depth] {
                 dispatch = 1;
-                curr_index = max_index;
+                current_depth += 1;
+                prio_stack[current_depth + 1] = max_prio;
+                id_stack[current_depth + 1] = max_index;
+            } else if i_return {
+                // tail chain
+               if max_prio >: prio_stack[current_depth - 1] && max_index != id_stack[current_depth] {
+                id_stack[current_depth] = max_index;
+                prio_stack[current_depth] = max_prio;
+                dispatch = 1;
+               }
+               else {
+                current_depth -= 1;
+                dispatch = 0;
+               }
             }
             else {
                 dispatch = 0;
             }
-            prev_prio = max_prio;
         }
     }
 
@@ -129,6 +163,9 @@ embed (inline) sv{{{
         Reg i_rd;
         CsrOp i_csr_op;
         logic [31:0] o_data;
+        logic i_return;
+        logic o_dispatch;
+        logic [1:0] o_depth;
         hippo_nclic_veryl___NCLIC__8 dut (
             .i_clk,
             .i_rst,
@@ -137,11 +174,15 @@ embed (inline) sv{{{
             .i_rs1_data,
             .i_rs1,
             .i_rd,
-            .i_csr_op
+            .i_csr_op,
+            .i_return,
+            .o_dispatch,
+            .o_depth
         );
         initial begin
             i_rst = 0;
             i_clk = 0;
+            i_return = 0;
             #15 i_rst = 1;
         end
 
@@ -149,6 +190,7 @@ embed (inline) sv{{{
 
         initial begin
             #20;
+            // int0 = prio 3 pending 0 ena 1
             i_csr_addr = 'h020;
             i_csr_ena = 1;
             i_rs1_data = 'b1101;
@@ -156,6 +198,17 @@ embed (inline) sv{{{
             i_rd = 'b00001;
             i_csr_op = CsrOp_CSRRW;
             #20;
+            assert(o_dispatch == 0 && o_depth == 0) else $error("fail cycle 1");
+            // let it marinate
+            i_csr_ena = 0;
+            i_rs1_data = 0;
+            i_rs1 = 0;
+            i_rd = 0;
+            i_csr_addr = 0;
+            i_csr_op = CsrOp_ECALL;
+            #20;
+            assert(o_dispatch == 0 && o_depth == 0) else $error("fail cycle 2");
+            // int1 = prio 1 pending 1 ena 1
             i_csr_addr = 'h021;
             i_csr_ena = 1;
             i_rs1_data = 'b0111;
@@ -163,6 +216,19 @@ embed (inline) sv{{{
             i_rd = 'b00001;
             i_csr_op = CsrOp_CSRRW;
             #20;
+            assert(o_dispatch == 1 && o_depth == 1)             
+             else $error("fail cycle 3: simple dispatch expected depth 1 dispatch 1 got depth %d dispatch %d", o_depth, o_dispatch);
+            // let it marinate again
+            i_csr_ena = 0;
+            i_rs1_data = 0;
+            i_rs1 = 0;
+            i_rd = 0;
+            i_csr_addr = 0;
+            i_csr_op = CsrOp_ECALL;
+            #20;
+            assert(o_dispatch == 0 && o_depth == 1)
+             else $error("fail cycle 4: running post dispatch, expected depth 1, dispatch 0 got depth %d dispatch %d", o_depth, o_dispatch);
+            // int2 = prio 3 pending 1 ena 1
             i_csr_addr = 'h022;
             i_csr_ena = 1;
             i_rs1_data = 'b1111;
@@ -170,6 +236,19 @@ embed (inline) sv{{{
             i_rd = 'b00001;
             i_csr_op = CsrOp_CSRRW;
             #20;
+            assert(o_dispatch == 1 && o_depth == 2)
+             else $error("fail cycle 5: preemption, expected depth 2 dispatch 1, got depth %d dispatch %d", o_depth, o_dispatch);
+            // let it marinate
+            i_csr_ena = 0;
+            i_rs1_data = 0;
+            i_rs1 = 0;
+            i_rd = 0;
+            i_csr_addr = 0;
+            i_csr_op = CsrOp_ECALL;
+            #20;
+            assert(o_dispatch == 0 && o_depth == 2)
+             else $error("fail cycle 6: running under preemption, expected depth 2 dispatch 0 got depth %d dispatch %d", o_depth, o_dispatch);
+            // int3 = prio 3 pending 1 ena 1
             i_csr_addr = 'h020;
             i_csr_ena = 1;
             i_rs1_data = 'b0010;
@@ -177,6 +256,24 @@ embed (inline) sv{{{
             i_rd = 'b00001;
             i_csr_op = CsrOp_CSRRS;
             #20;
+            assert(o_dispatch == 0 && o_depth == 2)
+             else $error("fail cycle 7: blocking same prio, expected depth 2 dispatch 0 got depth %d dispatch %d", o_depth, o_dispatch);
+            i_csr_addr = 'h020;
+            i_csr_ena = 0;
+            i_rs1_data = 'b0000;
+            i_rs1 = 'b00000;
+            i_rd = 'b00000;
+            i_csr_op = CsrOp_ECALL;
+            i_return = 1;
+            #20;
+            assert(o_dispatch == 1 && o_depth == 2)
+             else $error("fail cycle 8: tail chaining same prio, expected depth 2 dispatch 1 got depth %d dispatch %d", o_depth, o_dispatch);
+            #20;
+            assert(o_dispatch == 0 && o_depth == 1)
+             else $error("fail cycle 9: return, expected depth 1, dispatch 0, got depth %d dispatch %d", o_depth, o_dispatch);
+            #20;
+            assert(o_dispatch == 0 && o_depth == 0)
+             else $error("fail cycle 10: return, expected depth 0, dispatch 0, got depth %d dispatch %d", o_depth, o_dispatch);
             $finish;
         end
     endmodule
