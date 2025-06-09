@@ -7,3 +7,5 @@ target = { type = "directory", path = "target" }
 exclude_std = true
 [test]
 waveform_target = { type = "directory", path = "waveforms/" }
+[dependencies]
+veryl_csr = { github = "perlindgren/veryl_csr", version = "0.1.0" }

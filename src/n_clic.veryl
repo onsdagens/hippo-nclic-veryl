@@ -1,0 +1,183 @@
+import veryl_csr::CsrPkg::*;
+module instantiate (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    i_csr_ena : input logic      ,
+    i_csr_addr: input CsrAddr    ,
+    i_rs1_data: input logic  <32>,
+    i_rs1     : input Reg        ,
+    i_rd      : input Reg        ,
+    i_csr_op  : input CsrOp      ,
+) {
+    inst nclic: NCLIC::<8> (
+        i_clk       ,
+        i_rst       ,
+        i_csr_ena   ,
+        i_csr_addr  ,
+        i_rs1_data  ,
+        i_rs1       ,
+        i_rd        ,
+        i_csr_op    ,
+    );
+}
+module NCLIC::<Vectors: u32> #(
+    param Base    : CsrAddr = 'h020 as CsrAddr,
+    param MaxPrio : u32     = 4               ,
+    param PrioBits: u32     = $clog2(MaxPrio) ,
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+    // really the way CSR is implemented it should
+    // 100% be an interface and not a module.
+    // -- CSR interface
+    // input
+    i_csr_ena : input logic      ,
+    i_csr_addr: input CsrAddr    ,
+    i_rs1_data: input logic  <32>,
+    i_rs1     : input Reg        ,
+    i_rd      : input Reg        ,
+    i_csr_op  : input CsrOp,
+    // -----
+) {
+    // config: [PrioBits bit prio |1 bit pend | 1 bit ena]
+    const config_width: u32 = PrioBits + 1 + 1;
+    // having these be 32 bit feels notgood
+    //var config_reg_o_data     : logic<32>       [Vectors]; // bit of a bug again i think, we are assigning it to the output port of the csr.
+    var config_reg_intmd      : logic<32>       [Vectors];
+    var config_reg_w_ena_intmd: logic           [Vectors];
+    var config_regs           : logic<32>       [Vectors];
+    var masked_prios          : logic<PrioBits> [Vectors];
+    for i in 0..Vectors :config_csrs {
+        inst csr: veryl_csr::Csr #(
+            Addr      : (Base + i as CsrAddr) as CsrAddr,
+            FieldWidth: config_width                    ,
+        ) (
+            i_csr_ena                              ,
+            i_csr_addr                             ,
+            i_rs1_data                             ,
+            i_rs1                                  ,
+            i_rd                                   ,
+            i_csr_op                               ,
+            i_reg_data  : config_regs[i]           ,
+            o_reg_w_ena : config_reg_w_ena_intmd[i],
+            o_reg_w_data: config_reg_intmd[i]      ,
+            // don't cares for now
+            o_reg_r_ena : _,
+            o_reg_r_data: _,
+        );
+        always_ff {
+            if_reset {
+                config_regs[i] = 0;
+            } else {
+                if config_reg_w_ena_intmd[i] {
+                    config_regs[i] = config_reg_intmd[i];
+                }
+            }
+
+        }
+        // basically, this masks each vector priority with the vector enable and pending status.
+        // if enabled and pending, this yields the priority, otherwise just a 0.
+        // we also check if the register is being written, in that case we use the data to be written directly.
+        assign masked_prios[i] = if config_reg_w_ena_intmd[i] ?
+            (if config_reg_intmd[i][0] && config_reg_intmd[i][1] ? config_reg_intmd[i][3:2] : 0 as 2)
+        :
+            (if config_regs[i][0] && config_regs[i][1] ? (config_regs[i][3:2]) : (0 as 2))
+        ;
+    }
+    import ArbitrationPackage::*;
+    var max_index: logic<3>;
+    var max_prio: logic<2>;
+    inst arbitration: ArbitrationTree::<ArbitrationPackage::ArbitrationPolarity::MAX> (
+        values_i: masked_prios,
+        index_o: max_index,
+        prio_o: max_prio,
+    );
+
+    // some state machinery for keeping track of when an interrupt should be dispatched
+    var prev_prio: logic<2>;
+    var curr_index: logic<3>;
+    var dispatch: logic;
+    always_ff {
+        if_reset {
+            prev_prio = 0;
+            curr_index = 0;
+        } else {
+            if max_prio >: prev_prio {
+                dispatch = 1;
+                curr_index = max_index;
+            }
+            else {
+                dispatch = 0;
+            }
+            prev_prio = max_prio;
+        }
+    }
+
+}
+
+#[test(nclic)]
+embed (inline) sv{{{
+    module test;
+        import veryl_csr_CsrPkg::*;
+        logic i_clk;
+        logic i_rst;
+        logic i_csr_ena;
+        CsrAddr i_csr_addr;
+        logic [31:0] i_rs1_data;
+        Reg i_rs1;
+        Reg i_rd;
+        CsrOp i_csr_op;
+        logic [31:0] o_data;
+        hippo_nclic_veryl___NCLIC__8 dut (
+            .i_clk,
+            .i_rst,
+            .i_csr_ena,
+            .i_csr_addr,
+            .i_rs1_data,
+            .i_rs1,
+            .i_rd,
+            .i_csr_op
+        );
+        initial begin
+            i_rst = 0;
+            i_clk = 0;
+            #15 i_rst = 1;
+        end
+
+        always #10 i_clk = ~i_clk; 
+
+        initial begin
+            #20;
+            i_csr_addr = 'h020;
+            i_csr_ena = 1;
+            i_rs1_data = 'b1101;
+            i_rs1 = 'b00000;
+            i_rd = 'b00001;
+            i_csr_op = CsrOp_CSRRW;
+            #20;
+            i_csr_addr = 'h021;
+            i_csr_ena = 1;
+            i_rs1_data = 'b0111;
+            i_rs1 = 'b00000;
+            i_rd = 'b00001;
+            i_csr_op = CsrOp_CSRRW;
+            #20;
+            i_csr_addr = 'h022;
+            i_csr_ena = 1;
+            i_rs1_data = 'b1111;
+            i_rs1 = 'b00000;
+            i_rd = 'b00001;
+            i_csr_op = CsrOp_CSRRW;
+            #20;
+            i_csr_addr = 'h020;
+            i_csr_ena = 1;
+            i_rs1_data = 'b0010;
+            i_rs1 = 'b00000;
+            i_rd = 'b00001;
+            i_csr_op = CsrOp_CSRRS;
+            #20;
+            $finish;
+        end
+    endmodule
+}}}
