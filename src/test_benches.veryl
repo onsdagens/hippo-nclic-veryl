@@ -1,14 +1,15 @@
 #[test(arbitration)]
 {
-module instantiate_arb () {
-    var values: logic<2> [8];
+module instantiate_arb (
+    values_i: input logic<2> [8],
+) {
     inst max: ArbitrationTree::<ArbitrationPackage::ArbitrationPolarity::MAX> (
-        values_i: values,
+        values_i,
         index_o: _,
         prio_o: _,
     );
     inst min: ArbitrationTree::<ArbitrationPackage::ArbitrationPolarity::MIN> (
-        values_i: values,
+        values_i,
         index_o: _,
         prio_o: _,
     );
