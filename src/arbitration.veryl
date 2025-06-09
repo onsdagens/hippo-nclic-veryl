@@ -18,6 +18,8 @@ module ArbitrationTree::<Polarity: ArbitrationPackage::ArbitrationPolarity> (
     prio_o: output logic<2>,
 ) {
     // we can probably also do it this way generically,
+    // n + n / 2 + n / 4 + ... + 1 = 2n-1
+    // so let intermediate: logic<width> [2n-1]; 
     // think about it.
     let id_1: logic<3> = if Polarity == ArbitrationPackage::ArbitrationPolarity::MAX ?
      (if values_i[0] >= values_i[1] ? 0 : 1) :
