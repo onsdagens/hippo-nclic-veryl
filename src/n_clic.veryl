@@ -365,8 +365,66 @@ embed (inline) sv{{{
             i_return = 1;
             #20;
             assert(o_dispatch == 0 && o_depth == 0)
-             else $error("fail cycle 14: did not return from the external interrupt properly");
-
+             else $error("fail cycle 14: did not return from the external interrupt properly, got depth %d and dispatch %d", o_depth, o_dispatch);
+            // int0 = prio 3 pending 0 ena 1
+            i_csr_addr = 'h020;
+            i_csr_ena = 1;
+            i_rs1_data = 'b1101;
+            i_rs1 = 'b00000;
+            i_rd = 'b00001;
+            i_csr_op = CsrOp_CSRRW;
+            i_return = 0;
+            assert(o_dispatch == 0 && o_depth == 0)
+             else $error("fail cycle 15: did not return from the external interrupt properly");
+            #20;
+            // int1 = prio 2 pending 0 ena 1
+            i_csr_addr = 'h021;
+            i_csr_ena = 1;
+            i_rs1_data = 'b1001;
+            i_rs1 = 'b00000;
+            i_rd = 'b00001;
+            i_csr_op = CsrOp_CSRRW;
+            assert(o_dispatch == 0 && o_depth == 0)
+             else $error("fail cycle 16: did not return from the external interrupt properly, got depth %d and dispatch %d", o_depth, o_dispatch);
+            #20;
+            // int2 = prio 3 pending 0 ena 1
+            i_csr_addr = 'h020;
+            i_csr_ena = 1;
+            i_rs1_data = 'b0101;
+            i_rs1 = 'b00000;
+            i_rd = 'b00001;
+            i_csr_op = CsrOp_CSRRW;
+            assert(o_dispatch == 0 && o_depth == 0)
+             else $error("fail cycle 17: did not return from the external interrupt properly");
+            #20;
+            i_lines = 'b00000111; // pend all interrupts as external
+            i_csr_addr = 'h000;
+            i_csr_ena = 0;
+            i_rs1_data = 'b0000;
+            i_rd = 'b00000;
+            i_csr_op = CsrOp_ECALL;
+            #20;
+            assert(o_dispatch == 1 && o_depth == 1)
+             else $error("fail cycle 18: did not dispatch external interrupt proper");
+            i_lines = 'b00000000;
+            i_return = 1;
+            #20;
+            assert(o_dispatch == 1 && o_depth == 1)
+             else $error("fail cycle 19: did not tail chain external interrupt proper");
+            #20;
+            assert(o_dispatch == 1 && o_depth == 1)
+             else $error("fail cycle 20: did not tail chain external interrupt proper");
+            i_return = 0;
+            #20;
+            assert(o_dispatch == 0 && o_depth == 1)
+             else $error("fail cycle 21: did not stay within external interrupt state");
+            #20;
+            assert(o_dispatch == 0 && o_depth == 1)
+             else $error("fail cycle 22: did not stay within external interrupt state");
+            i_return = 1;
+            #20;
+            assert(o_dispatch == 0 && o_depth == 0)
+             else $error("fail cycle 23: did not return completely from external interrupts");
             $finish;
         end
     endmodule
