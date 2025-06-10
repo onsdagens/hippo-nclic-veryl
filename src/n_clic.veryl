@@ -425,6 +425,19 @@ embed (inline) sv{{{
             #20;
             assert(o_dispatch == 0 && o_depth == 0)
              else $error("fail cycle 23: did not return completely from external interrupts");
+            i_return = 0;
+            #20;
+            assert(o_dispatch == 0 && o_depth == 0)
+             else $error("fail cycle 24: did not stay at level 0");
+            i_return = 0;
+            #20;
+            assert(o_dispatch == 0 && o_depth == 0)
+             else $error("fail cycle 25: did not stay at level 0");
+            i_return = 0;
+            #20;
+            assert(o_dispatch == 0 && o_depth == 0)
+             else $error("fail cycle 26: did not stay at level 0");
+            i_return = 0;
             $finish;
         end
     endmodule
