@@ -1,4 +1,5 @@
 import veryl_csr::CsrPkg::*;
+// this is needed to generate code since NCLIC is generic
 module instantiate (
     i_clk: input clock,
     i_rst: input reset,
@@ -10,6 +11,8 @@ module instantiate (
     i_rd      : input Reg        ,
     i_csr_op  : input CsrOp      ,
     i_return  : input logic      ,
+
+    i_lines   : input logic <8>,
 ) {
     inst nclic: NCLIC::<8> (
         i_clk       ,
@@ -21,6 +24,7 @@ module instantiate (
         i_rd        ,
         i_csr_op    ,
         i_return    ,
+        i_lines     ,
     );
 }
 module NCLIC::<Vectors: u32> #(
@@ -30,10 +34,7 @@ module NCLIC::<Vectors: u32> #(
 ) (
     i_clk: input clock,
     i_rst: input reset,
-    // really the way CSR is implemented it should
-    // 100% be an interface and not a module.
     // -- CSR interface
-    // input
     i_csr_ena : input logic      ,
     i_csr_addr: input CsrAddr    ,
     i_rs1_data: input logic  <32>,
@@ -42,29 +43,45 @@ module NCLIC::<Vectors: u32> #(
     i_csr_op  : input CsrOp,
     // -----
     i_return  : input logic,
+    i_lines   : input logic<Vectors>,
     o_dispatch: output logic,
     o_depth: output logic<2>,
 ) {
-//    var curr_index: logic<3>;
+    // this one is combinational
     var dispatch: logic;
+    // this one holds the dispatch state for the rest of the cycle
+    var dispatch_latch: logic;
+    // state stack
     var prio_stack: logic<2> [4]; // 4 prio levels so max depth = 4 
     var id_stack: logic<3> [4];
+    // current state stack depth
     var current_depth: logic<2>;
+    // output signals
     assign o_depth = current_depth;
-    assign o_dispatch = dispatch;
+    assign o_dispatch = dispatch | dispatch_latch;
     
     // config: [PrioBits bit prio |1 bit pend | 1 bit ena]
-    const config_width: u32 = PrioBits + 1 + 1;
-    // having these be 32 bit feels notgood
-    //var config_reg_o_data     : logic<32>       [Vectors]; // bit of a bug again i think, we are assigning it to the output port of the csr.
-    var config_reg_intmd      : logic<32>       [Vectors];
-    var config_reg_w_ena_intmd: logic           [Vectors];
-    var config_regs           : logic<32>       [Vectors];
-    var masked_prios          : logic<PrioBits> [Vectors];
+    // for now this is unused
+    struct ConfigCSR {
+        prio: logic<PrioBits>,
+        pending: logic,
+        enabled: logic,
+    }
+    // this one contains the prio & enabled & pended status for each interrupt
+    var masked_prios: logic<PrioBits> [Vectors];
+    // this one contains the config ([PrioBits bit prio|1 bit pend|1 bit enable]) of each interrupt
+    var config_regs: logic<32> [Vectors];
+    // intermediate signals from the CSR interface to the underlying register
+    var config_reg_data_int: logic<32> [Vectors];
+    var config_reg_we_int: logic [Vectors]; 
+    // dispatching status for each of the interrupts
+    var dispatching: logic [Vectors];
     for i in 0..Vectors :config_csrs {
-        inst csr: veryl_csr::Csr #(
+        // CSR interface for each of the interrupts
+        inst csr_prio: veryl_csr::Csr #(
             Addr      : (Base + i as CsrAddr) as CsrAddr,
-            FieldWidth: config_width                    ,
+            FieldWidth: 2+1+1                    ,
+
         ) (
             i_csr_ena                              ,
             i_csr_addr                             ,
@@ -73,39 +90,68 @@ module NCLIC::<Vectors: u32> #(
             i_rd                                   ,
             i_csr_op                               ,
             i_reg_data  : config_regs[i]           ,
-            o_reg_w_ena : config_reg_w_ena_intmd[i],
-            o_reg_w_data: config_reg_intmd[i]      ,
+            o_reg_w_ena : config_reg_we_int[i],
+            o_reg_w_data: config_reg_data_int[i]      ,
             // don't cares for now
             o_reg_r_ena : _,
             o_reg_r_data: _,
         );
+        // state machinery for the underlying registers
         always_ff {
             if_reset {
+                // reset state
                 config_regs[i] = 0;
             } else {
-                if config_reg_w_ena_intmd[i] {
-                    if max_index != (i as 3) || !dispatch{
-                        config_regs[i] = config_reg_intmd[i];
-                    }
-                    else {
-                        // if we've dispatched this already then don't set the pending bit
-                        config_regs[i] = config_reg_intmd[i] & ('b1101 as 32);
+                // if there is no external interrupt coming in
+                if !i_lines[i]{
+                    // if there is a write to this specific CSR
+                    if config_reg_we_int[i] {
+                        // if we are already dispatching this interrupt, do not set the pend bit
+                        if dispatching[i] {
+                            config_regs[i] = config_reg_data_int[i] & 'b1101 as 32;
+                        }
+                        // otherwise just forward the interface data directly to the register
+                        else {
+                            config_regs[i] = config_reg_data_int[i];
+                        }
+                    } else if dispatching[i] { // if there is no write being made, check if we are dispatching this interrupt and zero the pend bit in that case.
+                        config_regs[i] = config_regs[i] & 'b1101 as 32;
                     }
                 }
-                else if max_index == (i as 3) && dispatch {
-                    // unpend self if we dispatch self
-                    config_regs[i] = config_regs[i] & ('b1101 as 32);
+                // if there is an external interrupt coming in
+                if i_lines[i] {
+                    // if we happen to be writing to the CSR also
+                    if config_reg_we_int[i] {
+                        // if we are dispatching the interrupt already, do not set the pend bit.
+                        // i don't know which behavior we actually want, but this seems reasonable for now.
+                        if dispatching[i] {
+                            config_regs[i] = config_reg_data_int[i] &'b1101 as 32;
+                        }
+                        // if we are not dispatching this interrupt, make sure that the pending bit is set by 
+                        // the external interrupt
+                        else {
+                            config_regs[i] = config_reg_data_int[i] | 'b0010 as 32;
+                        }
+                    }
+                    // if we are already dispatching this interrupt, do not set the pend bit
+                    else if dispatching[i] {
+                        config_regs[i] = config_regs[i] & 'b1101 as 32;
+                    } // otherwise make sure the pending bit is set by this external interrupt
+                    else {
+                        config_regs[i] = config_regs[i] | 'b0010 as 32;
+                    }
                 }
             }
 
         }
-        // basically, this masks each vector priority with the vector enable and pending status.
-        // if enabled and pending, this yields the priority, otherwise just a 0.
+        // basically, this masks each vector priority with the vector enable, pending status and whether there is an external interrupt on the
+        // corresponding line.
+        // if enabled and (pending OR external interrupt), this yields the priority, otherwise just a 0.
         // we also check if the register is being written, in that case we use the data to be written directly.
-        assign masked_prios[i] = if config_reg_w_ena_intmd[i] ?
-            (if config_reg_intmd[i][0] && config_reg_intmd[i][1] ? config_reg_intmd[i][3:2] : 0 as 2)
+        assign masked_prios[i] = if config_reg_we_int[i] ?
+            (if config_reg_data_int[i][0] && (config_reg_data_int[i][1] | i_lines[i]) ? config_reg_data_int[i][3:2] : 0 as 2)
         :
-            (if config_regs[i][0] && config_regs[i][1] ? (config_regs[i][3:2]) : (0 as 2))
+            (if config_regs[i][0] && (config_regs[i][1] | i_lines[1]) ? (config_regs[i][3:2]) : (0 as 2))
         ;
     }
     import ArbitrationPackage::*;
@@ -117,33 +163,57 @@ module NCLIC::<Vectors: u32> #(
         prio_o: max_prio,
     );
 
-    // some state machinery for interrupt dispatch 
-//    var prev_prio: logic<2>;
+    // some machinery to handle interrupt dispatch
+    always_comb {
+        dispatching = {0,0,0,0,0,0,0,0};
+        // if the current active max priority is greater than the current running priority
+        if max_prio >: prio_stack[current_depth] {
+            // set the corresponding interrupt as being dispatched
+            dispatching[max_index] = 1;
+        }
+        // if we want to return from an interrupt
+        else if i_return {
+            // if we are returning, check to which prio, and if we have anything more urgent to do
+            if max_prio >: prio_stack[current_depth - 1] {
+                // in that case, we want to tail chain the current max active interrupt
+                dispatching[max_index] = 1;
+            }
+        }
+    }
+    // this looks stupid but idk how to make verilator swallow anything else
+    assign dispatch = dispatching[0] | dispatching[1] | dispatching[2] | dispatching[3] | dispatching[4] | dispatching[5] | dispatching[6] | dispatching[7];
+    // state machinery for interrupt dispatch
     always_ff {
         if_reset {
+            // state stack
             prio_stack = {0,0,0,0};
             id_stack = {0,0,0,0};
             current_depth = 0;
+            // latched dispatch status
+            dispatch_latch = 0;
         } else {
-            if max_prio >: prio_stack[current_depth] {
-                dispatch = 1;
+            // if we are dispatching an interrupt raw
+            if dispatch & !i_return {
+                // push current state to the stack
                 current_depth += 1;
                 prio_stack[current_depth + 1] = max_prio;
                 id_stack[current_depth + 1] = max_index;
-            } else if i_return {
+            } else if i_return { // otherwise if we are returning
                 // tail chain
-               if max_prio >: prio_stack[current_depth - 1] && max_index != id_stack[current_depth] {
-                id_stack[current_depth] = max_index;
-                prio_stack[current_depth] = max_prio;
-                dispatch = 1;
-               }
+                if dispatch {
+                    id_stack[current_depth] = max_index;
+                    prio_stack[current_depth] = max_prio;
+                } // if not tail chaining, pop current context from the stack
                else {
                 current_depth -= 1;
-                dispatch = 0;
                }
+            } 
+            // latch current dispatch state
+            if dispatch & !dispatch_latch {
+                dispatch_latch = 1;
             }
             else {
-                dispatch = 0;
+                dispatch_latch = 0;
             }
         }
     }
@@ -166,6 +236,7 @@ embed (inline) sv{{{
         logic i_return;
         logic o_dispatch;
         logic [1:0] o_depth;
+        logic [7:0] i_lines;
         hippo_nclic_veryl___NCLIC__8 dut (
             .i_clk,
             .i_rst,
@@ -177,12 +248,14 @@ embed (inline) sv{{{
             .i_csr_op,
             .i_return,
             .o_dispatch,
-            .o_depth
+            .o_depth,
+            .i_lines
         );
         initial begin
             i_rst = 0;
             i_clk = 0;
             i_return = 0;
+            i_lines = 0;
             #15 i_rst = 1;
         end
 
@@ -274,6 +347,26 @@ embed (inline) sv{{{
             #20;
             assert(o_dispatch == 0 && o_depth == 0)
              else $error("fail cycle 10: return, expected depth 0, dispatch 0, got depth %d dispatch %d", o_depth, o_dispatch);
+            i_return = 0;
+            #20;
+            // external interrupt 1, should raise interrupt at prio 1
+            i_lines = 'b00000010;
+            #20;
+            assert(o_dispatch == 1 && o_depth == 1)
+             else $error("fail cycle 11: external interrupt 1");
+            #20;
+            assert(o_dispatch == 0 && o_depth == 1)
+             else $error("fail cycle 12: redispatched self when external line held high");
+            i_lines = 0;
+            i_return = 1;
+            #20;
+            assert(o_dispatch == 1 && o_depth == 1)
+             else $error("fail cycle 13: did not redispatch self after being pended during run");
+            i_return = 1;
+            #20;
+            assert(o_dispatch == 0 && o_depth == 0)
+             else $error("fail cycle 14: did not return from the external interrupt properly");
+
             $finish;
         end
     endmodule
